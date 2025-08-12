@@ -1,0 +1,514 @@
+---
+- name: VxRail 8 Upgrade Playbook using Dell VxRail Ansible Modules
+  hosts: localhost
+  gather_facts: yes
+  collections:
+    - dellemc.vxrail
+    - ansible.builtin
+    
+  vars:
+    # VxRail upgrade variables
+    vxrail_target_version: "8.0.322"
+    upgrade_bundle_path: "/mnt/nfs/repo/VXRAIL_COMPOSITE-SLIM-8.0.322-29020990_for_8.0.x.zip"
+    timeout: 21600  # 6 hours timeout for LCM operations - adjust per environment
+    min_disk_space_gb: 30  # Minimum free disk space required
+    
+    # VxRail Manager connection settings (following Dell module structure)
+    vxmip: "{{ ansible_host }}"
+    vcadmin: "{{ vault_vcenter_admin_username }}"    # e.g., administrator@vsphere.local
+    vcpasswd: "{{ vault_vcenter_admin_password }}"   # vCenter SSO password
+    
+    # Additional credentials for LCM operations
+    vc_root_account: "{{ vault_vcenter_root_username | default('root') }}"
+    vc_root_passwd: "{{ vault_vcenter_root_password }}"
+    vxm_root_account: "{{ vault_vxrail_root_username | default('root') }}"
+    vxm_root_passwd: "{{ vault_vxrail_root_password }}"
+    
+    # LCM upgrade bundle and options
+    bundle: "{{ upgrade_bundle_path | basename if upgrade_bundle_path is defined else omit }}"
+    target_hosts_name: "{{ target_hosts | default(omit) }}"
+    missing_file_check: "{{ missing_file_check | default(true) }}"
+    skip_failed_hosts: "{{ skip_failed_hosts | default(false) }}"
+    ecosystem_check_continue_with_incompatible: "{{ ecosystem_check_continue_with_incompatible | default(false) }}"
+    ecosystem_check_components: "{{ ecosystem_check_components | default(omit) }}"
+    enable_quick_boot: "{{ enable_quick_boot | default(true) }}"
+    parallel_remediation_enable: "{{ parallel_remediation_enable | default(true) }}"
+    parallel_remediation_max: "{{ parallel_remediation_max | default(4) }}"
+    enforce_quick_patch: "{{ enforce_quick_patch | default(false) }}"
+    
+    # API version (omit to use latest supported)
+    api_version_number: "{{ api_version | default(omit) }}"
+    
+    # Rollback settings
+    enable_rollback_on_failure: "{{ enable_rollback_on_failure | default(false) }}"
+    backup_verification_required: "{{ backup_verification_required | default(true) }}"
+
+  tasks:
+    # Block 2: System Information and Health Validation
+    - name: System information and health validation
+      block:
+        - name: Get VxRail system information
+          dellemc_vxrail_getsysteminfo:
+            vxmip: "{{ vxmip }}"
+            vcadmin: "{{ vcadmin }}"
+            vcpasswd: "{{ vcpasswd }}"
+            timeout: "{{ timeout | default(omit) }}"
+            api_version_number: 5
+          register: system_info
+          
+        - name: Display current VxRail version
+          debug:
+            msg: "Current VxRail version: {{ system_info }}"
+            #msg: "Current VxRail version: {{ system_info.System_Information.current_version }}"
+            
+        - name: Check if upgrade is needed
+          assert:
+            that:
+              - system_info.System_Information.current_version is version(vxrail_target_version, '<')
+            fail_msg: "System is already at or above target version {{ vxrail_target_version }}. Current: {{ system_info.System_Information.current_version }}"
+            success_msg: "Upgrade needed from {{ system_info.System_Information.current_version }} to {{ vxrail_target_version }}"
+            
+        - name: Get cluster information
+          dellemc.vxrail.dellemc_vxrail_getclusterinfo:
+            vxmip: "{{ vxmip }}"
+            vcadmin: "{{ vcadmin }}"
+            vcpasswd: "{{ vcpasswd }}"
+            timeout: "{{ timeout }}"
+            api_version_number: 5
+          register: cluster_info
+          
+        - name: Validate cluster health
+          assert:
+            that:
+              - cluster_info.Cluster_Information.health not in ["Critical", "Error"]
+            fail_msg: "Cluster health is {{ cluster_info.Cluster_Information.health }}. Cannot proceed with upgrade."
+            success_msg: "Cluster health validated: {{ cluster_info.Cluster_Information.health }}"
+            
+        - name: Get hosts information
+          dellemc.vxrail.dellemc_vxrail_hosts_get:
+            vxmip: "{{ vxmip }}"
+            vcadmin: "{{ vcadmin }}"
+            vcpasswd: "{{ vcpasswd }}"
+            timeout: "{{ timeout }}"
+            api_version_number: 1
+          register: hosts_info
+          
+        - name: Validate all hosts are operational
+          assert:
+            that:
+              - item.operational_status == "normal"
+            fail_msg: "Host {{ item.id }} ({{ item.hostname | default('Unknown') }}) is not operational: {{ item.operational_status }}"
+            loop: "{{ hosts_info.Hosts_Information }}"
+            loop_control:
+              label: "{{ item.hostname | default(item.id) }}"
+              
+        - name: Display system validation summary
+          debug:
+            msg: |
+              System Validation Summary:
+              - Current Version: {{ system_info.System_Information.version }}
+              - Target Version: {{ vxrail_target_version }}
+              - Cluster Health: {{ cluster_info.Cluster_Information.health }}
+              - Total Hosts: {{ hosts_info.Hosts_Information | length }}
+              - Operational Hosts: {{ hosts_info.Hosts_Information | selectattr('operational_status', 'equalto', 'normal') | list | length }}
+              
+        - name: Log system validation completion
+          lineinfile:
+            path: "/tmp/vxrail_upgrade_{{ ansible_date_time.epoch }}/upgrade_progress.log"
+            line: "{{ ansible_date_time.iso8601 }} - System validation completed successfully"
+          delegate_to: localhost
+      rescue:
+        - name: System validation failed
+          lineinfile:
+            path: "/tmp/vxrail_upgrade_{{ ansible_date_time.epoch }}/upgrade_progress.log"
+            line: "{{ ansible_date_time.iso8601 }} - System validation FAILED"
+          delegate_to: localhost
+          
+        - name: Fail after logging
+          fail:
+            msg: "System validation failed. Check cluster health and host status before proceeding."
+      tags: system_validation
+
+    # Block 3: Pre-upgrade system prechecks
+    - name: Pre-upgrade system prechecks
+      block:
+        - name: Run system prechecks
+          dellemc.vxrail.dellemc_vxrail_system_precheck:
+            vxmip: "{{ vxmip }}"
+            vcadmin: "{{ vcadmin }}"
+            vcpasswd: "{{ vcpasswd }}"
+            timeout: "{{ timeout }}"
+            api_version_number: "{{ api_version_number }}"
+          register: precheck_results
+          
+        - name: Display precheck results summary
+          debug:
+            msg: "System precheck completed. Check /tmp/vxrail_ansible_system_precheck.log for details."
+            
+        - name: Validate precheck passed
+          assert:
+            that:
+              - precheck_results.changed == true
+            fail_msg: "System prechecks failed. Review logs before proceeding."
+            success_msg: "System prechecks passed successfully"
+            
+        - name: Log precheck completion
+          lineinfile:
+            path: "/tmp/vxrail_upgrade_{{ ansible_date_time.epoch }}/upgrade_progress.log"
+            line: "{{ ansible_date_time.iso8601 }} - System prechecks completed successfully"
+          delegate_to: localhost
+      rescue:
+        - name: Log precheck failure
+          lineinfile:
+            path: "/tmp/vxrail_upgrade_{{ ansible_date_time.epoch }}/upgrade_progress.log"
+            line: "{{ ansible_date_time.iso8601 }} - System prechecks FAILED"
+          delegate_to: localhost
+          
+        - name: Precheck failed
+          fail:
+            msg: "System prechecks failed. Review /tmp/vxrail_ansible_system_precheck.log before proceeding."
+      tags: prechecks
+
+    # Block 4: Upload upgrade bundle (if specified)
+    - name: Upload upgrade bundle
+      block:
+        - name: Check if upgrade bundle exists locally
+          stat:
+            path: "{{ upgrade_bundle_path }}"
+          register: bundle_file
+          delegate_to: localhost
+          
+        - name: Fail if bundle doesn't exist
+          fail:
+            msg: "Upgrade bundle not found at {{ upgrade_bundle_path }}"
+          when: not bundle_file.stat.exists
+          
+        - name: Generate SHA512 checksum for bundle
+          shell: sha512sum "{{ upgrade_bundle_path }}" | awk '{print $1}'
+          register: bundle_checksum
+          delegate_to: localhost
+          changed_when: false
+          
+        - name: Upload VxRail upgrade bundle
+          dellemc.vxrail.dellemc_vxrail_lcm_customized_component:
+            vxmip: "{{ vxmip }}"
+            vcadmin: "{{ vcadmin }}"
+            vcpasswd: "{{ vcpasswd }}"
+            customized_component: false  # Set to false for upgrade bundles
+            component_bundle: "{{ upgrade_bundle_path }}"
+            type: "bundle"
+            checksum: "{{ bundle_checksum.stdout }}"
+            timeout: "{{ timeout }}"
+            api_version_number: "{{ api_version_number }}"
+          register: upload_result
+          
+        - name: Display upload results
+          debug:
+            msg: "Bundle upload completed. Check /tmp/vxrail_ansible_lcm_customized_component.log for details."
+            
+        - name: Log bundle upload completion
+          lineinfile:
+            path: "/tmp/vxrail_upgrade_{{ ansible_date_time.epoch }}/upgrade_progress.log"
+            line: "{{ ansible_date_time.iso8601 }} - Bundle upload completed successfully"
+          delegate_to: localhost
+      rescue:
+        - name: Log bundle upload failure
+          lineinfile:
+            path: "/tmp/vxrail_upgrade_{{ ansible_date_time.epoch }}/upgrade_progress.log"
+            line: "{{ ansible_date_time.iso8601 }} - Bundle upload FAILED"
+          delegate_to: localhost
+          
+        - name: Bundle upload failed
+          fail:
+            msg: "Bundle upload failed. Check bundle path, permissions, and network connectivity."
+      when: upgrade_bundle_path is defined and upgrade_bundle_path != ""
+      tags: bundle_upload
+
+    # Block 5: LCM Advisory and Precheck
+    - name: LCM advisory and compatibility validation
+      block:
+        - name: Get LCM advisory report
+          dellemc.vxrail.dellemc_vxrail_lcm_advisory_report:
+            vxmip: "{{ vxmip }}"
+            vcadmin: "{{ vcadmin }}"
+            vcpasswd: "{{ vcpasswd }}"
+            timeout: "{{ timeout }}"
+            api_version_number: "{{ api_version_number }}"
+          register: advisory_report
+          
+        - name: Display advisory report summary
+          debug:
+            msg: "LCM advisory report completed. Check /tmp/vxrail_ansible_lcm_advisory_report.log for details."
+            
+        - name: Run LCM precheck
+          dellemc.vxrail.dellemc_vxrail_lcm_precheck:
+            vxmip: "{{ vxmip }}"
+            vcadmin: "{{ vcadmin }}"
+            vcpasswd: "{{ vcpasswd }}"
+            timeout: "{{ timeout }}"
+            api_version_number: "{{ api_version_number }}"
+          register: lcm_precheck
+          
+        - name: Display LCM precheck summary
+          debug:
+            msg: "LCM precheck completed. Check /tmp/vxrail_ansible_lcm_precheck.log for details."
+            
+        - name: Log LCM validation completion
+          lineinfile:
+            path: "/tmp/vxrail_upgrade_{{ ansible_date_time.epoch }}/upgrade_progress.log"
+            line: "{{ ansible_date_time.iso8601 }} - LCM advisory and precheck completed successfully"
+          delegate_to: localhost
+      rescue:
+        - name: Log LCM validation failure
+          lineinfile:
+            path: "/tmp/vxrail_upgrade_{{ ansible_date_time.epoch }}/upgrade_progress.log"
+            line: "{{ ansible_date_time.iso8601 }} - LCM advisory/precheck FAILED"
+          delegate_to: localhost
+          
+        - name: LCM advisory/precheck failed
+          fail:
+            msg: "LCM advisory or precheck failed. Review compatibility before proceeding."
+      tags: lcm_validation
+
+    # Block 6: Perform VxRail LCM Upgrade
+    - name: Execute VxRail LCM upgrade
+      block:
+        - name: Confirm upgrade execution
+          pause:
+            prompt: |
+              ==========================================
+              READY TO START VXRAIL LCM UPGRADE
+              ==========================================
+              Current Version: {{ system_info.System_Information.version }}
+              Target Version: {{ vxrail_target_version }}
+              Cluster Health: {{ cluster_info.Cluster_Information.health }}
+              Number of Hosts: {{ hosts_info.Hosts_Information | length }}
+              
+              This operation will take several hours and will:
+              - Put cluster in maintenance mode
+              - Update all VxRail components
+              - Reboot hosts as needed
+              - Update firmware and drivers
+              
+              Press ENTER to continue or Ctrl+C to abort...
+          when: not (skip_confirmation | default(false))
+          
+        - name: Log upgrade start
+          lineinfile:
+            path: "/tmp/vxrail_upgrade_{{ ansible_date_time.epoch }}/upgrade_progress.log"
+            line: "{{ ansible_date_time.iso8601 }} - LCM upgrade initiated"
+          delegate_to: localhost
+          
+        - name: Start VxRail LCM upgrade
+          dellemc.vxrail.dellemc_vxrail_lcm:
+            vxmip: "{{ vxmip }}"
+            vcadmin: "{{ vcadmin }}"
+            vcpasswd: "{{ vcpasswd }}"
+            bundle: "{{ bundle }}"
+            vc_root_account: "{{ vc_root_account }}"
+            vc_root_passwd: "{{ vc_root_passwd }}"
+            vxm_root_account: "{{ vxm_root_account }}"
+            vxm_root_passwd: "{{ vxm_root_passwd }}"
+            target_hosts_name: "{{ target_hosts_name }}"
+            missing_file_check: "{{ missing_file_check }}"
+            skip_failed_hosts: "{{ skip_failed_hosts }}"
+            ecosystem_check_continue_with_incompatible: "{{ ecosystem_check_continue_with_incompatible }}"
+            ecosystem_check_components: "{{ ecosystem_check_components }}"
+            enable_quick_boot: "{{ enable_quick_boot }}"
+            parallel_remediation_enable: "{{ parallel_remediation_enable }}"
+            parallel_remediation_max: "{{ parallel_remediation_max }}"
+            enforce_quick_patch: "{{ enforce_quick_patch }}"
+            timeout: "{{ timeout }}"
+            api_version_number: "{{ api_version_number }}"
+          register: lcm_upgrade
+          notify: "upgrade completed"
+          
+        - name: Display LCM upgrade initiation
+          debug:
+            msg: "LCM upgrade initiated. Monitor progress in /tmp/vxrail_ansible_lcm.log"
+            
+        - name: Verify LCM upgrade completion
+          assert:
+            that:
+              - lcm_upgrade.changed == true
+            fail_msg: "LCM upgrade failed to start or complete"
+            success_msg: "LCM upgrade completed successfully"
+            
+        - name: Log upgrade completion
+          lineinfile:
+            path: "/tmp/vxrail_upgrade_{{ ansible_date_time.epoch }}/upgrade_progress.log"
+            line: "{{ ansible_date_time.iso8601 }} - LCM upgrade completed successfully"
+          delegate_to: localhost
+      rescue:
+        - name: Log upgrade failure
+          lineinfile:
+            path: "/tmp/vxrail_upgrade_{{ ansible_date_time.epoch }}/upgrade_progress.log"
+            line: "{{ ansible_date_time.iso8601 }} - LCM upgrade FAILED"
+          delegate_to: localhost
+          
+        - name: LCM upgrade failed - initial logging
+          debug:
+            msg: "LCM upgrade failed. Attempting retry if enabled..."
+            
+        - name: Attempt LCM retry
+          dellemc.vxrail.dellemc_vxrail_lcm_retry:
+            vxmip: "{{ vxmip }}"
+            vcadmin: "{{ vcadmin }}"
+            vcpasswd: "{{ vcpasswd }}"
+            timeout: "{{ timeout }}"
+            api_version_number: "{{ api_version_number }}"
+          register: lcm_retry
+          ignore_errors: yes
+          
+        - name: Log retry attempt
+          lineinfile:
+            path: "/tmp/vxrail_upgrade_{{ ansible_date_time.epoch }}/upgrade_progress.log"
+            line: "{{ ansible_date_time.iso8601 }} - LCM retry attempted: {{ 'SUCCESS' if lcm_retry.changed else 'FAILED' }}"
+          delegate_to: localhost
+          
+        - name: Attempt rollback if enabled
+          block:
+            - name: Initiate rollback procedure
+              debug:
+                msg: "Rollback is enabled but not implemented in this playbook. Manual intervention required."
+              when: enable_rollback_on_failure | bool
+          when: enable_rollback_on_failure | bool
+          
+        - name: Fail after retry and rollback attempts
+          fail:
+            msg: "LCM upgrade failed after retry attempts. Check logs: /tmp/vxrail_ansible_lcm.log and custom logs in /tmp/vxrail_upgrade_{{ ansible_date_time.epoch }}/"
+      tags: lcm_upgrade
+
+    # # Block 7: Post-upgrade validation
+    # - name: Post-upgrade validation
+    #   block:
+    #     - name: Wait for system stabilization
+    #       pause:
+    #         minutes: 10
+    #         prompt: "Waiting for system to stabilize after upgrade..."
+            
+    #     - name: Get updated system information
+    #       dellemc.vxrail.dellemc_vxrail_system:
+    #         vxmip: "{{ vxmip }}"
+    #         vcadmin: "{{ vcadmin }}"
+    #         vcpasswd: "{{ vcpasswd }}"
+    #         timeout: "{{ timeout }}"
+    #         api_version_number: "{{ api_version_number }}"
+    #       register: updated_system_info
+          
+    #     - name: Verify version upgrade success
+    #       assert:
+    #         that:
+    #           - updated_system_info.System_Information.version is version(system_info.System_Information.version, '>')
+    #         fail_msg: "Version upgrade failed. Still at {{ updated_system_info.System_Information.version }}"
+    #         success_msg: "Successfully upgraded to {{ updated_system_info.System_Information.version }}"
+            
+    #     - name: Get post-upgrade cluster information
+    #       dellemc.vxrail.dellemc_vxrail_cluster:
+    #         vxmip: "{{ vxmip }}"
+    #         vcadmin: "{{ vcadmin }}"
+    #         vcpasswd: "{{ vcpasswd }}"
+    #         timeout: "{{ timeout }}"
+    #         api_version_number: "{{ api_version_number }}"
+    #       register: updated_cluster_info
+          
+    #     - name: Validate cluster health post-upgrade
+    #       assert:
+    #         that:
+    #           - updated_cluster_info.Cluster_Information.health not in ["Critical", "Error"]
+    #         fail_msg: "Post-upgrade cluster health is {{ updated_cluster_info.Cluster_Information.health }}"
+    #         success_msg: "Post-upgrade cluster health: {{ updated_cluster_info.Cluster_Information.health }}"
+            
+    #     - name: Get post-upgrade hosts information
+    #       dellemc.vxrail.dellemc_vxrail_hosts:
+    #         vxmip: "{{ vxmip }}"
+    #         vcadmin: "{{ vcadmin }}"
+    #         vcpasswd: "{{ vcpasswd }}"
+    #         timeout: "{{ timeout }}"
+    #         api_version_number: "{{ api_version_number }}"
+    #       register: updated_hosts_info
+          
+    #     - name: Validate all hosts post-upgrade
+    #       assert:
+    #         that:
+    #           - item.operational_status == "normal"
+    #         fail_msg: "Post-upgrade: Host {{ item.hostname | default(item.id) }} status: {{ item.operational_status }}"
+    #         loop: "{{ updated_hosts_info.Hosts_Information }}"
+    #         loop_control:
+    #           label: "{{ item.hostname | default(item.id) }}"
+              
+    #     - name: Log post-upgrade validation success
+    #       lineinfile:
+    #         path: "/tmp/vxrail_upgrade_{{ ansible_date_time.epoch }}/upgrade_progress.log"
+    #         line: "{{ ansible_date_time.iso8601 }} - Post-upgrade validation completed successfully"
+    #       delegate_to: localhost
+    #   rescue:
+    #     - name: Log post-upgrade validation issues
+    #       lineinfile:
+    #         path: "/tmp/vxrail_upgrade_{{ ansible_date_time.epoch }}/upgrade_progress.log"
+    #         line: "{{ ansible_date_time.iso8601 }} - Post-upgrade validation encountered issues"
+    #       delegate_to: localhost
+          
+    #     - name: Post-upgrade validation issues
+    #       debug:
+    #         msg: "Post-upgrade validation encountered issues. Review cluster and host status manually."
+    #   always:
+    #     - name: Generate comprehensive upgrade report
+    #       debug:
+    #         msg: |
+    #           ===============================================
+    #           VxRail Upgrade Summary Report
+    #           ===============================================
+    #           Upgrade Details:
+    #           - Target Version: {{ vxrail_target_version }}
+    #           - Previous Version: {{ system_info.System_Information.version }}
+    #           - Final Version: {{ updated_system_info.System_Information.version | default('Unknown') }}
+    #           - Upgrade Status: {{ 'SUCCESS' if lcm_upgrade.changed and (updated_system_info.System_Information.version | default('0.0.0')) is version(system_info.System_Information.version, '>') else 'FAILED' }}
+              
+    #           System Health:
+    #           - Pre-upgrade Health: {{ cluster_info.Cluster_Information.health }}
+    #           - Post-upgrade Health: {{ updated_cluster_info.Cluster_Information.health | default('Unknown') }}
+              
+    #           Infrastructure:
+    #           - Number of Hosts: {{ hosts_info.Hosts_Information | length }}
+    #           - Operational Hosts (Pre): {{ hosts_info.Hosts_Information | selectattr('operational_status', 'equalto', 'normal') | list | length }}
+    #           - Operational Hosts (Post): {{ updated_hosts_info.Hosts_Information | selectattr('operational_status', 'equalto', 'normal') | list | length | default('Unknown') }}
+              
+    #           Log Files for Review:
+    #           - Custom Progress Log: /tmp/vxrail_upgrade_{{ ansible_date_time.epoch }}/upgrade_progress.log
+    #           - System Info: /tmp/vxrail_ansible_system.log
+    #           - Cluster Info: /tmp/vxrail_ansible_cluster.log
+    #           - Hosts Info: /tmp/vxrail_ansible_hosts.log
+    #           - LCM Upgrade: /tmp/vxrail_ansible_lcm.log
+    #           - System Precheck: /tmp/vxrail_ansible_system_precheck.log
+    #           - LCM Precheck: /tmp/vxrail_ansible_lcm_precheck.log
+    #           - Bundle Upload: /tmp/vxrail_ansible_lcm_customized_component.log
+    #           ===============================================
+              
+    #     - name: Save upgrade report to file
+    #       copy:
+    #         content: |
+    #           VxRail Upgrade Report - {{ ansible_date_time.iso8601 }}
+    #           ================================================
+    #           Target Version: {{ vxrail_target_version }}
+    #           Previous Version: {{ system_info.System_Information.version }}
+    #           Final Version: {{ updated_system_info.System_Information.version | default('Unknown') }}
+    #           Upgrade Status: {{ 'SUCCESS' if lcm_upgrade.changed and (updated_system_info.System_Information.version | default('0.0.0')) is version(system_info.System_Information.version, '>') else 'FAILED' }}
+    #           Pre-upgrade Health: {{ cluster_info.Cluster_Information.health }}
+    #           Post-upgrade Health: {{ updated_cluster_info.Cluster_Information.health | default('Unknown') }}
+    #           Host Count: {{ hosts_info.Hosts_Information | length }}
+    #           Operational Hosts (Pre): {{ hosts_info.Hosts_Information | selectattr('operational_status', 'equalto', 'normal') | list | length }}
+    #           Operational Hosts (Post): {{ updated_hosts_info.Hosts_Information | selectattr('operational_status', 'equalto', 'normal') | list | length | default('Unknown') }}
+              
+    #           Detailed Progress Log: /tmp/vxrail_upgrade_{{ ansible_date_time.epoch }}/upgrade_progress.log
+    #         dest: "/tmp/vxrail_upgrade_{{ ansible_date_time.epoch }}/final_upgrade_report.txt"
+    #       delegate_to: localhost
+    #   tags: post_validation
+
+  handlers:
+    - name: upgrade completed
+      lineinfile:
+        path: "/tmp/vxrail_upgrade_{{ ansible_date_time.epoch }}/upgrade_progress.log"
+        line: "{{ ansible_date_time.iso8601 }} - VxRail upgrade handler triggered - upgrade completed"
+        create: yes
+      delegate_to: localhost
