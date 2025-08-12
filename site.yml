@@ -1,12 +1,12 @@
 ---
 - name: Test
   hosts: localhost
-    vars:
-      vxmip: "{{ vxrail_host | default('localhost') }}"
-      vcadmin: "{{ vxrail_user | default('admin') }}"
-      vcpasswd: "{{ vxrail_password }}"
-      timeout: "{{ vxrail_timeout | default('100') }}":
-      api_version_number: "{{ vxrail_api_version | default('5') }}":
+  vars:
+    vxmip: "{{ vxrail_host | default('localhost') }}"
+    vcadmin: "{{ vxrail_user | default('admin') }}"
+    vcpasswd: "{{ vxrail_password }}"
+    timeout: "{{ vxrail_timeout | default('100') }}":
+    api_version_number: "{{ vxrail_api_version | default('5') }}":
   tasks:
     - name: get system info
       dellemc_vxrail_getsysteminfo:
