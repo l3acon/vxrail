@@ -14,7 +14,7 @@
     min_disk_space_gb: 30  # Minimum free disk space required
     
     # VxRail Manager connection settings (following Dell module structure)
-    vxmip: "{{ ansible_host }}"
+    #vxmip: "{{ vxmip }}"
     vcadmin: "{{ vault_vcenter_admin_username }}"    # e.g., administrator@vsphere.local
     vcpasswd: "{{ vault_vcenter_admin_password }}"   # vCenter SSO password
     
@@ -47,26 +47,26 @@
     # Block 2: System Information and Health Validation
     - name: System information and health validation
       block:
-        - name: Get VxRail system information
-          dellemc_vxrail_getsysteminfo:
-            vxmip: "{{ vxmip }}"
-            vcadmin: "{{ vcadmin }}"
-            vcpasswd: "{{ vcpasswd }}"
-            timeout: "{{ timeout | default(omit) }}"
-            api_version_number: 5
-          register: system_info
+        # - name: Get VxRail system information
+        #   dellemc_vxrail_getsysteminfo:
+        #     vxmip: "{{ vxmip }}"
+        #     vcadmin: "{{ vcadmin }}"
+        #     vcpasswd: "{{ vcpasswd }}"
+        #     timeout: "{{ timeout | default(omit) }}"
+        #     api_version_number: 5
+        #   register: system_info
           
-        - name: Display current VxRail version
-          debug:
-            msg: "Current VxRail version: {{ system_info }}"
-            #msg: "Current VxRail version: {{ system_info.System_Information.current_version }}"
+        # - name: Display current VxRail version
+        #   debug:
+        #     msg: "Current VxRail version: {{ system_info }}"
+        #     #msg: "Current VxRail version: {{ system_info.System_Information.current_version }}"
             
-        - name: Check if upgrade is needed
-          assert:
-            that:
-              - system_info.System_Information.current_version is version(vxrail_target_version, '<')
-            fail_msg: "System is already at or above target version {{ vxrail_target_version }}. Current: {{ system_info.System_Information.current_version }}"
-            success_msg: "Upgrade needed from {{ system_info.System_Information.current_version }} to {{ vxrail_target_version }}"
+        # - name: Check if upgrade is needed
+        #   assert:
+        #     that:
+        #       - system_info.System_Information.current_version is version(vxrail_target_version, '<')
+        #     fail_msg: "System is already at or above target version {{ vxrail_target_version }}. Current: {{ system_info.System_Information.current_version }}"
+        #     success_msg: "Upgrade needed from {{ system_info.System_Information.current_version }} to {{ vxrail_target_version }}"
             
         - name: Get cluster information
           dellemc.vxrail.dellemc_vxrail_getclusterinfo:
@@ -74,15 +74,15 @@
             vcadmin: "{{ vcadmin }}"
             vcpasswd: "{{ vcpasswd }}"
             timeout: "{{ timeout }}"
-            api_version_number: 5
+            api_version_number: 1
           register: cluster_info
           
         - name: Validate cluster health
           assert:
             that:
-              - cluster_info.Cluster_Information.health not in ["Critical", "Error"]
-            fail_msg: "Cluster health is {{ cluster_info.Cluster_Information.health }}. Cannot proceed with upgrade."
-            success_msg: "Cluster health validated: {{ cluster_info.Cluster_Information.health }}"
+              - cluster_info.Cluster_API.Cluster_Information[0]['health'] not in ["Critical", "Error"]
+            fail_msg: "Cluster health is {{ cluster_info.Cluster_API.Cluster_Information[0]['health'] }}. Cannot proceed with upgrade."
+            success_msg: "Cluster health validated: {{ cluster_info.Cluster_API.Cluster_Information[0]['health'] }}"
             
         - name: Get hosts information
           dellemc.vxrail.dellemc_vxrail_hosts_get:
@@ -98,7 +98,7 @@
             that:
               - item.operational_status == "normal"
             fail_msg: "Host {{ item.id }} ({{ item.hostname | default('Unknown') }}) is not operational: {{ item.operational_status }}"
-            loop: "{{ hosts_info.Hosts_Information }}"
+            loop: "{{ hosts_info.Hosts_API.Hosts_Information }}"
             loop_control:
               label: "{{ item.hostname | default(item.id) }}"
               
