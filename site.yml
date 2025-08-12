@@ -9,7 +9,7 @@
     api_version_number: "{{ vxrail_api_version | default('5') }}"
   tasks:
     - name: get system info
-      dellemc_vxrail_getsysteminfo:
+      dellemc.vxrail.dellemc_vxrail_getsysteminfo:
         vxmip: "{{ vxmip }}"
         vcadmin: "{{ vcadmin }}"
         vcpasswd: "{{ vcpasswd }}"
